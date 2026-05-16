@@ -25,19 +25,25 @@ fn is_retryable_reqwest_err(e: &reqwest::Error) -> bool {
 
 /// Pull complete `\n\n`-delimited SSE events out of `buf`, returning the
 /// payloads of any `data:` lines collected from each event.
-fn drain_sse_events(buf: &mut String) -> Vec<String> {
+///
+/// `buf` is bytes (not `String`) so a multi-byte UTF-8 character split across
+/// chunk boundaries doesn't get dropped — we decode only after a separator
+/// proves the event is complete.
+#[doc(hidden)]
+pub fn drain_sse_events(buf: &mut Vec<u8>) -> Vec<String> {
     let mut out = Vec::new();
     loop {
-        let crlf = buf.find("\r\n\r\n");
-        let lf = buf.find("\n\n");
+        let crlf = find_subseq(buf, b"\r\n\r\n");
+        let lf = find_subseq(buf, b"\n\n");
         let (sep, skip) = match (crlf, lf) {
             (Some(a), Some(b)) if a <= b => (a, 4),
             (Some(a), None) => (a, 4),
             (_, Some(b)) => (b, 2),
             (None, None) => return out,
         };
-        let event: String = buf.drain(..sep).collect();
+        let event_bytes: Vec<u8> = buf.drain(..sep).collect();
         buf.drain(..skip);
+        let Ok(event) = std::str::from_utf8(&event_bytes) else { continue };
         for line in event.lines() {
             if let Some(data) = line.strip_prefix("data:") {
                 out.push(data.trim().to_string());
@@ -46,18 +52,26 @@ fn drain_sse_events(buf: &mut String) -> Vec<String> {
     }
 }
 
+fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[doc(hidden)]
+pub mod __test_only {
+    //! Re-exports for integration tests. Not part of the public API.
+    pub use super::drain_sse_events;
+}
+
 /// Parse OpenAI Chat Completions SSE — concatenate `choices[0].delta.content`,
 /// stop on `[DONE]`.
 async fn parse_openai_chat_sse(response: reqwest::Response) -> Result<String> {
     let mut stream = response.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut out = String::new();
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| ContribError::Llm(format!("OpenAI SSE chunk: {}", e)))?;
-        if let Ok(s) = std::str::from_utf8(&bytes) {
-            buf.push_str(s);
-        }
+        buf.extend_from_slice(&bytes);
         for data in drain_sse_events(&mut buf) {
             if data == "[DONE]" {
                 return Ok(out);
@@ -76,14 +90,12 @@ async fn parse_openai_chat_sse(response: reqwest::Response) -> Result<String> {
 /// stop on `message_stop`.
 async fn parse_anthropic_messages_sse(response: reqwest::Response) -> Result<String> {
     let mut stream = response.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut out = String::new();
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| ContribError::Llm(format!("Anthropic SSE chunk: {}", e)))?;
-        if let Ok(s) = std::str::from_utf8(&bytes) {
-            buf.push_str(s);
-        }
+        buf.extend_from_slice(&bytes);
         for data in drain_sse_events(&mut buf) {
             let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
             match v["type"].as_str().unwrap_or("") {

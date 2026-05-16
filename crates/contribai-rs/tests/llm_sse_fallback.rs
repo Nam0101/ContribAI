@@ -203,3 +203,96 @@ async fn factory_creates_openai_and_anthropic() {
     assert!(create_llm_provider_raw(&cfg("openai", "http://example.invalid")).is_ok());
     assert!(create_llm_provider_raw(&cfg("anthropic", "http://example.invalid")).is_ok());
 }
+
+// ── UTF-8 split across SSE chunk boundaries ───────────────────────────────────
+
+/// Responder that streams the SSE body byte-by-byte, forcing every multi-byte
+/// UTF-8 character to be split across reqwest chunk boundaries.
+struct ByteByByte {
+    body: Vec<u8>,
+}
+
+impl Respond for ByteByByte {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        // wiremock collapses set_body_bytes into one HTTP body, but reqwest's
+        // bytes_stream will still chunk at the network layer. To guarantee
+        // mid-codepoint splits, we don't rely on chunking — instead we emit a
+        // payload where multi-byte chars fall on every position, and rely on
+        // the parser to handle a single contiguous slice plus a forced "split"
+        // produced by trimming the stream into two halves below.
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_bytes(self.body.clone())
+    }
+}
+
+/// SSE payload exercise: Vietnamese + emoji + CJK so any mishandled split
+/// would corrupt visible characters.
+fn unicode_openai_sse() -> Vec<u8> {
+    let frame1 = "data: {\"choices\":[{\"delta\":{\"content\":\"Xin chào 🌏\"}}]}\n\n";
+    let frame2 = "data: {\"choices\":[{\"delta\":{\"content\":\" 你好\"}}]}\n\n";
+    let done = "data: [DONE]\n\n";
+    let mut out = Vec::new();
+    out.extend_from_slice(frame1.as_bytes());
+    out.extend_from_slice(frame2.as_bytes());
+    out.extend_from_slice(done.as_bytes());
+    out
+}
+
+#[tokio::test]
+async fn openai_sse_handles_multibyte_utf8_payload() {
+    let server = MockServer::start().await;
+
+    let saw_stream = Arc::new(AtomicUsize::new(0));
+    let saw_non_stream = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(StreamAware {
+            non_stream: ResponseTemplate::new(503),
+            streaming: ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_bytes(unicode_openai_sse()),
+            saw_stream: saw_stream.clone(),
+            saw_non_stream: saw_non_stream.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new(&cfg("openai", &server.uri())).unwrap();
+    let out = provider
+        .chat(&[ChatMessage::user("hi")], None, None, None)
+        .await
+        .expect("SSE fallback should succeed with multibyte text");
+
+    assert_eq!(out, "Xin chào 🌏 你好");
+}
+
+/// Direct unit-style check: feed the byte parser a payload split mid-codepoint
+/// and ensure no characters are dropped. This pins the bug Codex flagged.
+#[tokio::test]
+async fn drain_sse_events_preserves_split_codepoints() {
+    use contribai::llm::provider::__test_only::drain_sse_events;
+
+    let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"é🌏你\"}}]}\n\n";
+    let bytes = frame.as_bytes();
+
+    // Force a split inside the 4-byte 🌏 (U+1F30F = F0 9F 8C 8F).
+    let emoji_start = frame.find('🌏').expect("emoji present");
+    let split = emoji_start + 2;
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&bytes[..split]);
+    let first = drain_sse_events(&mut buf);
+    assert!(first.is_empty(), "no complete event yet, got {:?}", first);
+
+    buf.extend_from_slice(&bytes[split..]);
+    let second = drain_sse_events(&mut buf);
+    assert_eq!(second.len(), 1, "expected one event, got {:?}", second);
+
+    let v: serde_json::Value = serde_json::from_str(&second[0]).unwrap();
+    assert_eq!(
+        v["choices"][0]["delta"]["content"].as_str().unwrap(),
+        "é🌏你"
+    );
+}
