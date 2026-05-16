@@ -5,12 +5,104 @@
 //! Port from Python `llm/provider.py`.
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::info;
 
 use crate::core::config::LlmConfig;
 use crate::core::error::{ContribError, Result};
+
+// ── SSE streaming fallback helpers ────────────────────────────────────────────
+
+fn is_retryable_status(s: u16) -> bool {
+    (500..=599).contains(&s)
+}
+
+fn is_retryable_reqwest_err(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+/// Pull complete `\n\n`-delimited SSE events out of `buf`, returning the
+/// payloads of any `data:` lines collected from each event.
+fn drain_sse_events(buf: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        let crlf = buf.find("\r\n\r\n");
+        let lf = buf.find("\n\n");
+        let (sep, skip) = match (crlf, lf) {
+            (Some(a), Some(b)) if a <= b => (a, 4),
+            (Some(a), None) => (a, 4),
+            (_, Some(b)) => (b, 2),
+            (None, None) => return out,
+        };
+        let event: String = buf.drain(..sep).collect();
+        buf.drain(..skip);
+        for line in event.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                out.push(data.trim().to_string());
+            }
+        }
+    }
+}
+
+/// Parse OpenAI Chat Completions SSE — concatenate `choices[0].delta.content`,
+/// stop on `[DONE]`.
+async fn parse_openai_chat_sse(response: reqwest::Response) -> Result<String> {
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    let mut out = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| ContribError::Llm(format!("OpenAI SSE chunk: {}", e)))?;
+        if let Ok(s) = std::str::from_utf8(&bytes) {
+            buf.push_str(s);
+        }
+        for data in drain_sse_events(&mut buf) {
+            if data == "[DONE]" {
+                return Ok(out);
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                if let Some(s) = v["choices"][0]["delta"]["content"].as_str() {
+                    out.push_str(s);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parse Anthropic Messages SSE — concatenate `content_block_delta` text deltas,
+/// stop on `message_stop`.
+async fn parse_anthropic_messages_sse(response: reqwest::Response) -> Result<String> {
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    let mut out = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| ContribError::Llm(format!("Anthropic SSE chunk: {}", e)))?;
+        if let Ok(s) = std::str::from_utf8(&bytes) {
+            buf.push_str(s);
+        }
+        for data in drain_sse_events(&mut buf) {
+            let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+            match v["type"].as_str().unwrap_or("") {
+                "content_block_delta" => {
+                    if let Some(s) = v["delta"]["text"].as_str() {
+                        out.push_str(s);
+                    }
+                }
+                "message_stop" => return Ok(out),
+                "error" => {
+                    let msg = v["error"]["message"].as_str().unwrap_or("stream error");
+                    return Err(ContribError::Llm(format!("Anthropic SSE error: {}", msg)));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// Message in a chat conversation.
 #[derive(Debug, Clone)]
@@ -648,44 +740,85 @@ impl LlmProvider for OpenAIProvider {
             msgs.push(json!({ "role": &msg.role, "content": &msg.content }));
         }
 
-        let response = self
+        let url = format!("{}/chat/completions", self.base_url);
+        let body = json!({
+            "model": self.model,
+            "messages": msgs,
+            "temperature": temp,
+            "max_tokens": max_tok,
+        });
+
+        // Try non-streaming first.
+        let attempt = self
             .client
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&json!({
-                "model": self.model,
-                "messages": msgs,
-                "temperature": temp,
-                "max_tokens": max_tok,
-            }))
+            .json(&body)
             .send()
-            .await
-            .map_err(|e| ContribError::Llm(format!("OpenAI HTTP error: {}", e)))?;
+            .await;
 
-        let status = response.status();
-        let data: Value = response
-            .json()
-            .await
-            .map_err(|e| ContribError::Llm(format!("OpenAI JSON parse: {}", e)))?;
-
-        if !status.is_success() {
-            let error_msg = data["error"]["message"].as_str().unwrap_or("Unknown error");
-            if status.as_u16() == 429 {
-                return Err(ContribError::Llm(format!(
-                    "OpenAI rate limit: {}",
-                    error_msg
-                )));
+        match attempt {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    let data: Value = response.json().await.map_err(|e| {
+                        ContribError::Llm(format!("OpenAI JSON parse: {}", e))
+                    })?;
+                    let text = data["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap_or("");
+                    return Ok(text.to_string());
+                }
+                if !is_retryable_status(status.as_u16()) {
+                    let data: Value = response.json().await.unwrap_or(Value::Null);
+                    let error_msg =
+                        data["error"]["message"].as_str().unwrap_or("Unknown error");
+                    if status.as_u16() == 429 {
+                        return Err(ContribError::Llm(format!(
+                            "OpenAI rate limit: {}",
+                            error_msg
+                        )));
+                    }
+                    return Err(ContribError::Llm(format!(
+                        "OpenAI error {}: {}",
+                        status, error_msg
+                    )));
+                }
+                tracing::warn!(
+                    status = %status,
+                    "OpenAI non-stream failed, falling back to SSE"
+                );
             }
-            return Err(ContribError::Llm(format!(
-                "OpenAI error {}: {}",
-                status, error_msg
-            )));
+            Err(e) if is_retryable_reqwest_err(&e) => {
+                tracing::warn!(error = %e, "OpenAI non-stream transport error, falling back to SSE");
+            }
+            Err(e) => return Err(ContribError::Llm(format!("OpenAI HTTP error: {}", e))),
         }
 
-        let text = data["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("");
-        Ok(text.to_string())
+        // SSE fallback.
+        let mut stream_body = body.clone();
+        stream_body["stream"] = Value::Bool(true);
+
+        let stream_resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Accept", "text/event-stream")
+            .json(&stream_body)
+            .send()
+            .await
+            .map_err(|e| ContribError::Llm(format!("OpenAI SSE HTTP error: {}", e)))?;
+
+        let status = stream_resp.status();
+        if !status.is_success() {
+            let text = stream_resp.text().await.unwrap_or_default();
+            return Err(ContribError::Llm(format!(
+                "OpenAI SSE error {}: {}",
+                status,
+                text.chars().take(500).collect::<String>()
+            )));
+        }
+        parse_openai_chat_sse(stream_resp).await
     }
 }
 
@@ -770,39 +903,83 @@ impl LlmProvider for AnthropicProvider {
             body["system"] = Value::String(sys.to_string());
         }
 
-        let response = self
+        let url = format!("{}/messages", self.base_url);
+
+        // Try non-streaming first.
+        let attempt = self
             .client
-            .post(format!("{}/messages", self.base_url))
+            .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
             .send()
-            .await
-            .map_err(|e| ContribError::Llm(format!("Anthropic HTTP error: {}", e)))?;
+            .await;
 
-        let status = response.status();
-        let data: Value = response
-            .json()
-            .await
-            .map_err(|e| ContribError::Llm(format!("Anthropic JSON parse: {}", e)))?;
-
-        if !status.is_success() {
-            let error_msg = data["error"]["message"].as_str().unwrap_or("Unknown error");
-            if status.as_u16() == 429 {
-                return Err(ContribError::Llm(format!(
-                    "Anthropic rate limit: {}",
-                    error_msg
-                )));
+        match attempt {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    let data: Value = response.json().await.map_err(|e| {
+                        ContribError::Llm(format!("Anthropic JSON parse: {}", e))
+                    })?;
+                    let text = data["content"][0]["text"].as_str().unwrap_or("");
+                    return Ok(text.to_string());
+                }
+                if !is_retryable_status(status.as_u16()) {
+                    let data: Value = response.json().await.unwrap_or(Value::Null);
+                    let error_msg =
+                        data["error"]["message"].as_str().unwrap_or("Unknown error");
+                    if status.as_u16() == 429 {
+                        return Err(ContribError::Llm(format!(
+                            "Anthropic rate limit: {}",
+                            error_msg
+                        )));
+                    }
+                    return Err(ContribError::Llm(format!(
+                        "Anthropic error {}: {}",
+                        status, error_msg
+                    )));
+                }
+                tracing::warn!(
+                    status = %status,
+                    "Anthropic non-stream failed, falling back to SSE"
+                );
             }
-            return Err(ContribError::Llm(format!(
-                "Anthropic error {}: {}",
-                status, error_msg
-            )));
+            Err(e) if is_retryable_reqwest_err(&e) => {
+                tracing::warn!(error = %e, "Anthropic non-stream transport error, falling back to SSE");
+            }
+            Err(e) => {
+                return Err(ContribError::Llm(format!("Anthropic HTTP error: {}", e)));
+            }
         }
 
-        let text = data["content"][0]["text"].as_str().unwrap_or("");
-        Ok(text.to_string())
+        // SSE fallback.
+        let mut stream_body = body.clone();
+        stream_body["stream"] = Value::Bool(true);
+
+        let stream_resp = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&stream_body)
+            .send()
+            .await
+            .map_err(|e| ContribError::Llm(format!("Anthropic SSE HTTP error: {}", e)))?;
+
+        let status = stream_resp.status();
+        if !status.is_success() {
+            let text = stream_resp.text().await.unwrap_or_default();
+            return Err(ContribError::Llm(format!(
+                "Anthropic SSE error {}: {}",
+                status,
+                text.chars().take(500).collect::<String>()
+            )));
+        }
+        parse_anthropic_messages_sse(stream_resp).await
     }
 }
 
