@@ -296,3 +296,62 @@ async fn drain_sse_events_preserves_split_codepoints() {
         "é🌏你"
     );
 }
+
+// ── Proxies that always return SSE ────────────────────────────────────────────
+//
+// Some OpenAI-compatible routers (e.g. nip.io reverse proxies in front of
+// Claude) ignore `stream:false` and respond with `Content-Type: text/event-stream`
+// + 200. The provider must recognize the header and parse SSE instead of
+// trying to decode JSON, otherwise every call fails with "JSON parse error".
+
+#[tokio::test]
+async fn openai_handles_sse_on_2xx_when_stream_false() {
+    let server = MockServer::start().await;
+
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+               data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n\
+               data: [DONE]\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = OpenAIProvider::new(&cfg("openai", &server.uri())).unwrap();
+    let out = provider
+        .chat(&[ChatMessage::user("hi")], None, None, None)
+        .await
+        .expect("must parse SSE on 2xx success when proxy ignores stream:false");
+
+    assert_eq!(out, "Hi there");
+}
+
+#[tokio::test]
+async fn anthropic_handles_sse_on_2xx_when_stream_false() {
+    let server = MockServer::start().await;
+
+    let sse = "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n\
+               data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n\
+               data: {\"type\":\"message_stop\"}\n\n";
+
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new(&cfg("anthropic", &server.uri())).unwrap();
+    let out = provider
+        .chat(&[ChatMessage::user("hi")], None, None, None)
+        .await
+        .expect("must parse SSE on 2xx success when proxy ignores stream:false");
+
+    assert_eq!(out, "Hi there");
+}

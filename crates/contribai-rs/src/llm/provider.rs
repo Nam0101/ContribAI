@@ -773,6 +773,18 @@ impl LlmProvider for OpenAIProvider {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
+                    // Some proxies always return SSE regardless of `stream:false`.
+                    // If Content-Type is text/event-stream, parse it as a stream
+                    // instead of failing JSON decode.
+                    let ct = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if ct.contains("text/event-stream") {
+                        return parse_openai_chat_sse(response).await;
+                    }
                     let data: Value = response.json().await.map_err(|e| {
                         ContribError::Llm(format!("OpenAI JSON parse: {}", e))
                     })?;
@@ -932,6 +944,15 @@ impl LlmProvider for AnthropicProvider {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
+                    let ct = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if ct.contains("text/event-stream") {
+                        return parse_anthropic_messages_sse(response).await;
+                    }
                     let data: Value = response.json().await.map_err(|e| {
                         ContribError::Llm(format!("Anthropic JSON parse: {}", e))
                     })?;
