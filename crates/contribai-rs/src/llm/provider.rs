@@ -43,7 +43,9 @@ pub fn drain_sse_events(buf: &mut Vec<u8>) -> Vec<String> {
         };
         let event_bytes: Vec<u8> = buf.drain(..sep).collect();
         buf.drain(..skip);
-        let Ok(event) = std::str::from_utf8(&event_bytes) else { continue };
+        let Ok(event) = std::str::from_utf8(&event_bytes) else {
+            continue;
+        };
         for line in event.lines() {
             if let Some(data) = line.strip_prefix("data:") {
                 out.push(data.trim().to_string());
@@ -97,7 +99,9 @@ async fn parse_anthropic_messages_sse(response: reqwest::Response) -> Result<Str
         let bytes = chunk.map_err(|e| ContribError::Llm(format!("Anthropic SSE chunk: {}", e)))?;
         buf.extend_from_slice(&bytes);
         for data in drain_sse_events(&mut buf) {
-            let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
             match v["type"].as_str().unwrap_or("") {
                 "content_block_delta" => {
                     if let Some(s) = v["delta"]["text"].as_str() {
@@ -785,9 +789,10 @@ impl LlmProvider for OpenAIProvider {
                     if ct.contains("text/event-stream") {
                         return parse_openai_chat_sse(response).await;
                     }
-                    let data: Value = response.json().await.map_err(|e| {
-                        ContribError::Llm(format!("OpenAI JSON parse: {}", e))
-                    })?;
+                    let data: Value = response
+                        .json()
+                        .await
+                        .map_err(|e| ContribError::Llm(format!("OpenAI JSON parse: {}", e)))?;
                     let text = data["choices"][0]["message"]["content"]
                         .as_str()
                         .unwrap_or("");
@@ -795,8 +800,7 @@ impl LlmProvider for OpenAIProvider {
                 }
                 if !is_retryable_status(status.as_u16()) {
                     let data: Value = response.json().await.unwrap_or(Value::Null);
-                    let error_msg =
-                        data["error"]["message"].as_str().unwrap_or("Unknown error");
+                    let error_msg = data["error"]["message"].as_str().unwrap_or("Unknown error");
                     if status.as_u16() == 429 {
                         return Err(ContribError::Llm(format!(
                             "OpenAI rate limit: {}",
@@ -953,16 +957,16 @@ impl LlmProvider for AnthropicProvider {
                     if ct.contains("text/event-stream") {
                         return parse_anthropic_messages_sse(response).await;
                     }
-                    let data: Value = response.json().await.map_err(|e| {
-                        ContribError::Llm(format!("Anthropic JSON parse: {}", e))
-                    })?;
+                    let data: Value = response
+                        .json()
+                        .await
+                        .map_err(|e| ContribError::Llm(format!("Anthropic JSON parse: {}", e)))?;
                     let text = data["content"][0]["text"].as_str().unwrap_or("");
                     return Ok(text.to_string());
                 }
                 if !is_retryable_status(status.as_u16()) {
                     let data: Value = response.json().await.unwrap_or(Value::Null);
-                    let error_msg =
-                        data["error"]["message"].as_str().unwrap_or("Unknown error");
+                    let error_msg = data["error"]["message"].as_str().unwrap_or("Unknown error");
                     if status.as_u16() == 429 {
                         return Err(ContribError::Llm(format!(
                             "Anthropic rate limit: {}",

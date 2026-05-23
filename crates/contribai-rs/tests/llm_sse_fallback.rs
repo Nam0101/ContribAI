@@ -119,7 +119,11 @@ async fn openai_does_not_fallback_on_4xx() {
     let msg = err.to_string();
     assert!(msg.contains("400"), "got: {}", msg);
     assert!(msg.contains("bad input"), "got: {}", msg);
-    assert_eq!(saw_stream.load(Ordering::SeqCst), 0, "stream must not be tried on 4xx");
+    assert_eq!(
+        saw_stream.load(Ordering::SeqCst),
+        0,
+        "stream must not be tried on 4xx"
+    );
     assert_eq!(saw_non_stream.load(Ordering::SeqCst), 1);
 }
 
@@ -315,8 +319,7 @@ async fn openai_handles_sse_on_2xx_when_stream_false() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            ResponseTemplate::new(200).set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
         )
         .mount(&server)
         .await;
@@ -341,8 +344,7 @@ async fn anthropic_handles_sse_on_2xx_when_stream_false() {
     Mock::given(method("POST"))
         .and(path("/messages"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            ResponseTemplate::new(200).set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
         )
         .mount(&server)
         .await;
